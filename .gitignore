@@ -1,0 +1,6 @@
+riscv_simulator
+riscv_simulator.exe
+a.out
+*.o
+*.obj
+*.exe

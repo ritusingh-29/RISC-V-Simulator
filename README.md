@@ -1,243 +1,185 @@
 # RISC-V Pipeline Simulator
 
-A C++ implementation of a **5-stage RISC-V pipeline simulator** supporting the **RV32I Base Integer ISA**, **Compressed (C) Extension**, and partial **Floating-Point (F) Extension**. The simulator performs instruction decoding, pipeline execution, hazard detection, forwarding, and branch handling while providing human-readable instruction disassembly.
+A cycle-accurate **5-stage RISC-V pipeline** written in C++. It decodes machine code, steps IF → ID → EX → MEM → WB, and prints each stage every cycle so you can watch hazards, forwarding, stalls, and control-flow flushes.
+
+ISA coverage: **RV32I** (base integer), a **subset of the C (compressed) extension**, and a **partial F (single-precision float)** set.
+
+The runnable source is `simulator.cpp`. It is the merge of the original simulator (`Final.cpp`) with the v2 bug fixes (`riscv_final_v2.cpp`).
 
 ---
 
-## Features
+## How the pipeline works
 
-- RV32I instruction decoding
-- Support for the RISC-V Compressed (C) Extension
-- Partial support for Floating-Point (F) instructions
-- Five-stage pipeline simulation
-  - Instruction Fetch (IF)
-  - Instruction Decode (ID)
-  - Execute (EX)
-  - Memory Access (MEM)
-  - Write Back (WB)
-- Pipeline hazard detection
-- Data forwarding
-- Pipeline stalls and flushes
-- Branch and jump handling
-- Human-readable assembly generation
-- Instruction execution visualization
+Stages run **backwards each cycle** (WB, then MEM, then EX, then ID, then IF). That matches a hardware clock edge: the oldest instruction writes the register file first, so younger instructions in EX can forward from MEM/WB in the same cycle.
+
+```mermaid
+flowchart LR
+    IF["IF<br/>fetch + decompress"] --> ID["ID<br/>decode + hazard note"]
+    ID --> EX["EX<br/>ALU, branch, jal/jalr"]
+    EX --> MEM["MEM<br/>load / store"]
+    MEM --> WB["WB<br/>write rd / fd"]
+```
+
+```mermaid
+flowchart TB
+    subgraph mem ["Memory (word-addressed, 4 Ki words)"]
+        IMEM["instruction words"]
+        DMEM["data words"]
+    end
+    subgraph rf ["Register files"]
+        X["x0–x31  (x0 hardwired 0)"]
+        F["f0–f31"]
+    end
+    PC((PC)) --> IF
+    IMEM --> IF
+    IF --> ID
+    X --> EX
+    F --> EX
+    EX -->|"taken branch / jump"| PC
+    EX --> MEM
+    DMEM --> MEM
+    MEM --> DMEM
+    MEM --> WB
+    WB --> X
+    WB --> F
+```
+
+### Cycle order and forwarding
+
+```mermaid
+sequenceDiagram
+    participant WB
+    participant MEM
+    participant EX
+    participant ID
+    participant IF
+    Note over WB,IF: One simulated clock cycle
+    WB->>WB: commit rd/fd
+    MEM->>MEM: load/store using latched operands
+    EX->>EX: read regs, then forward from WB, then from MEM
+    Note right of EX: MEM overrides WB (newer producer wins)
+    ID->>ID: latch fetched instruction
+    IF->>IF: fetch at PC, PC += 2 or 4
+```
 
 ---
 
-## Supported Instruction Formats
+## What v2 fixed (now in `simulator.cpp`)
+
+| Issue in v1 | Fix |
+| --- | --- |
+| Branch / `jal` / `jalr` used the **fetch PC**, often off by 4 | Each stage keeps its own PC; targets and link addresses use **EX PC** (`PC+imm`, link = `PC+4`) |
+| Forwarding applied MEM then WB, so **older WB overwrote newer MEM** | Apply **WB first, then MEM** |
+| Byte/halfword access ignored the byte offset | Shift by `(addr % 4) * 8`; stores merge with a mask |
+| Compressed bit check used the **whole word** | Test the **halfword at `PC % 4`** |
+| Halfword accesses had no alignment rule | Require **2-byte** alignment for halfword load/store |
+| ALU/FP writeback was incomplete | One `compute_integer_result` / `compute_float_result` path for execute + writeback |
+
+v1 also inserted a **load-use stall**. v2 treats that as a log line only: reverse stage order plus forwarding is enough for the bundled demo. A true interlocked pipeline would still stall a load whose result is needed in the next instruction’s EX before MEM completes.
+
+---
+
+## Instruction support
 
 ### RV32I
 
-- **R-Type**
-  - ADD
-  - SUB
-  - SLL
-  - SLT
-  - SLTU
-  - XOR
-  - SRL
-  - SRA
-  - OR
-  - AND
+| Format | Instructions |
+| --- | --- |
+| R | `add`, `sub`, `sll`, `slt`, `sltu`, `xor`, `srl`, `sra`, `or`, `and` |
+| I (ALU) | `addi`, `slti`, `sltiu`, `xori`, `ori`, `andi`, `slli`, `srli`, `srai` |
+| I (load) | `lb`, `lh`, `lw`, `lbu`, `lhu` (`lwu` / `ld` are decoded; treated as word on this RV32 model) |
+| S | `sb`, `sh`, `sw` (`sd` decoded as word) |
+| B | `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu` |
+| U | `lui`, `auipc` (decoded; `auipc` is not yet written back) |
+| J | `jal`, `jalr` |
+| SYSTEM | `ecall` (halts), `ebreak` (decoded) |
 
-- **I-Type**
-  - ADDI
-  - SLTI
-  - SLTIU
-  - XORI
-  - ORI
-  - ANDI
-  - SLLI
-  - SRLI
-  - SRAI
-  - JALR
-  - LB
-  - LH
-  - LW
-  - LBU
-  - LHU
+### Compressed (C) — implemented
 
-- **S-Type**
-  - SB
-  - SH
-  - SW
+Expanded to 32-bit in IF, then run as the matching RV32I op:
 
-- **B-Type**
-  - BEQ
-  - BNE
-  - BLT
-  - BGE
-  - BLTU
-  - BGEU
+- `c.addi`, `c.lw`, `c.sw`, `c.beqz`
 
-- **U-Type**
-  - LUI
-  - AUIPC
+`c.bnez` is listed in older notes but **not** implemented.
 
-- **J-Type**
-  - JAL
+### Floating-point (F) — partial
+
+- `fadd.s`, `fsub.s`, `fmul.s`, `fdiv.s`
+- `flw`, `fsw`
+
+No rounding-mode, `fmv`, compares, or conversions.
 
 ---
 
-### Compressed (C) Extension
+## Hazards
 
-Includes decoding support for common compressed instructions such as
-
-- C.ADDI
-- C.LW
-- C.SW
-- C.BEQZ
-- C.BNEZ
-
----
-
-### Floating-Point (Partial)
-
-Basic floating-point register support and instruction decoding.
-
----
-
-## Pipeline Architecture
-
-```
-                +-----------+
-                |    IF     |
-                +-----------+
-                      |
-                      v
-                +-----------+
-                |    ID     |
-                +-----------+
-                      |
-                      v
-                +-----------+
-                |    EX     |
-                +-----------+
-                      |
-                      v
-                +-----------+
-                |   MEM     |
-                +-----------+
-                      |
-                      v
-                +-----------+
-                |    WB     |
-                +-----------+
+```mermaid
+flowchart TD
+    RAW["RAW data hazard"] --> FWD["Forward from MEM or WB into EX"]
+    LU["Load-use"] --> NOTE["Logged in ID; demo relies on forwarding / stage order"]
+    BR["Taken branch or jump in EX"] --> FLUSH["Flush IF/ID; redirect PC"]
+    EC["ecall"] --> HALT["Halt"]
 ```
 
-The simulator models a classic 5-stage RISC-V pipeline while handling
-
-- Data hazards
-- Control hazards
-- Pipeline forwarding
-- Pipeline stalls
-- Pipeline flushing after branches
+- **x0** is forced to 0 after every writeback.
+- Misaligned word/halfword accesses halt with a reason string.
+- Fetching past the last instruction inserts a **bubble** so `jalr` / `ecall` already in the pipe can finish; the sim stops when the pipeline is empty (or on `ecall`).
 
 ---
 
-## Instruction Decoding
+## Built-in demo program
 
-Each instruction is decoded by extracting
+`main()` loads a small program at `0x1000` (not a random opcode dump):
 
-- Opcode
-- Destination Register (rd)
-- Source Registers (rs1, rs2)
-- funct3
-- funct7
-- Immediate values
+1. Sum `1 + 2 + 3 + 4 + 5` in a `blt` loop (`x2 = 15`).
+2. `sw` the sum at `0x1100`, then `lw` it back into `x6`.
+3. `jal` to a subroutine that does `addi x6, x6, 10`, then `jalr` return.
+4. Store `25` at `0x1104` and `ecall`.
 
-The decoder reconstructs immediates according to the instruction format and generates a readable assembly representation.
-
-Example:
-
-Machine Code
-
-```
-0x00A50533
-```
-
-Decoded Assembly
-
-```
-ADD x10, x10, x5
-```
+That path exercises ALU, branch, load/store, `jal`/`jalr`, and halt.
 
 ---
 
-## Register File
+## Build and run
 
-- 32 Integer Registers
-- 32 Floating-Point Registers
-
----
-
-## Hazard Handling
-
-The simulator implements
-
-- RAW hazard detection
-- Forwarding from later pipeline stages
-- Load-use stalls
-- Pipeline flushing for branches and jumps
-
----
-
-## Building
-
-Compile using any C++17 compatible compiler.
+Needs a C++17 compiler.
 
 ```bash
-g++ Final.cpp -o riscv_simulator
-```
-
-Run
-
-```bash
+g++ -std=c++17 simulator.cpp -o riscv_simulator
 ./riscv_simulator
 ```
 
----
+On Windows (MinGW / MSYS):
 
-## Future Improvements
+```powershell
+g++ -std=c++17 simulator.cpp -o riscv_simulator.exe
+.\riscv_simulator.exe
+```
 
-- Complete RV32F implementation
-- RV32M Extension (Multiplication and Division)
-- Cache simulation
-- Branch prediction
-- Memory hierarchy simulation
-- Performance statistics
-- Pipeline visualization
+Output is a per-cycle trace: Fetch, Decode, Execute, Memory, Writeback.
 
----
-
-## Learning Outcomes
-
-This project demonstrates concepts in
-
-- Computer Architecture
-- Processor Design
-- Instruction Set Architecture (ISA)
-- RTL-inspired datapath modeling
-- Pipeline execution
-- Hazard detection
-- Instruction decoding
-- Computer Organization
+To try other machine code, replace the `program` vector in `main()` with 32-bit little-endian RISC-V words (compressed ops packed in the low or high halfword of a word, matching PC).
 
 ---
 
-## Changes to V2
-Branch/Jump/Link addresses now use per‑stage PC values
-Branches, jal, and jalr calculate targets and return addresses correctly, instead of using a later fetch PC that was off by 4 bytes.
+## Project layout
 
-Forwarding priority is fixed
-Newer results from MEM stage correctly override older results from WB stage, so instructions always see the most recent producer’s value.
+| File | Role |
+| --- | --- |
+| `simulator.cpp` | **Canonical** decoder + CPU + demo (`main`) |
+| `Final.cpp` | v1 snapshot (kept for comparison) |
+| `riscv_final_v2.cpp` | v2 snapshot (kept for comparison) |
 
-Byte and halfword loads/stores now use the correct byte offset
-They shift by (address % 4) * 8, and stores preserve the other bytes with proper masks.
+Compile **`simulator.cpp`** for interviews and demos.
 
-Compressed instruction detection checks the correct halfword
-The code now selects the correct halfword based on PC % 4 before testing the low bits, avoiding misclassification.
+---
 
-Alignment checks are added for halfword access
-Halfword loads/stores now require 2‑byte alignment, just like real RISC‑V.
+## Ideas to extend
 
+- Finish `auipc` writeback (needs the instruction PC in the result helper)
+- More C-extension opcodes (`c.bnez`, `c.j`, `c.mv`, `c.li`, …)
+- Full RV32F and RV32M
+- Real load-use interlock (stall IF/ID one cycle)
+- Branch predictor + mispredict stats
+- Cache / memory hierarchy
+- Cycle counts: IPC, stall/flush tallies
