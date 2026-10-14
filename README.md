@@ -170,16 +170,8 @@ To try other machine code, replace the `program` vector in `main()` with 32-bit 
 | `Final.cpp` | v1 snapshot (kept for comparison) |
 | `riscv_final_v2.cpp` | v2 snapshot (kept for comparison) |
 
-Compile **`simulator.cpp`** for interviews and demos.
+Compile **`simulator.cpp`** .
 
 ---
 
-## Ideas to extend
 
-- Finish `auipc` writeback (needs the instruction PC in the result helper)
-- More C-extension opcodes (`c.bnez`, `c.j`, `c.mv`, `c.li`, …)
-- Full RV32F and RV32M
-- Real load-use interlock (stall IF/ID one cycle)
-- Branch predictor + mispredict stats
-- Cache / memory hierarchy
-- Cycle counts: IPC, stall/flush tallies
